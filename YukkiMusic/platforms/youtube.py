@@ -25,7 +25,8 @@ from YukkiMusic.utils.decorators import asyncify
 from YukkiMusic.utils.formatters import seconds_to_min, time_to_seconds
 
 # Add these to your config.py
-YOUTUBE_API_KEY = config.YOUTUBE_API_KEY  # Get from Google Cloud Console
+# Add this line to your config.py
+YOUTUBE_API_KEY = "AIzaSyAC4bk5Zh1KxNuGnu_28uwJXpOPh0H1i0k"
 YOUTUBE_API_BASE_URL = "https://www.googleapis.com/youtube/v3"
 
 NOTHING = {"cookies_dead": None}
