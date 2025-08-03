@@ -10,9 +10,10 @@
 import asyncio
 import os
 import re
+from typing import Dict, List, Optional, Tuple
 
+import aiohttp
 from async_lru import alru_cache
-from py_yt import VideosSearch
 from pyrogram.enums import MessageEntityType
 from pyrogram.types import Message
 from yt_dlp import YoutubeDL
@@ -22,6 +23,10 @@ from config import cookies
 from YukkiMusic.utils.database import is_on_off
 from YukkiMusic.utils.decorators import asyncify
 from YukkiMusic.utils.formatters import seconds_to_min, time_to_seconds
+
+# Add these to your config.py
+YOUTUBE_API_KEY = config.YOUTUBE_API_KEY  # Get from Google Cloud Console
+YOUTUBE_API_BASE_URL = "https://www.googleapis.com/youtube/v3"
 
 NOTHING = {"cookies_dead": None}
 
@@ -41,21 +46,69 @@ async def shell_cmd(cmd):
     return out.decode("utf-8")
 
 
-class YouTube:
+class YouTubeAPI:
     def __init__(self):
+        self.api_key = YOUTUBE_API_KEY
+        self.base_url = YOUTUBE_API_BASE_URL
         self.base = "https://www.youtube.com/watch?v="
         self.regex = r"(?:youtube\.com|youtu\.be)"
         self.status = "https://www.youtube.com/oembed?url="
         self.listbase = "https://youtube.com/playlist?list="
         self.reg = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
+    async def _make_api_request(self, endpoint: str, params: Dict) -> Optional[Dict]:
+        """Make a request to YouTube API v3"""
+        params["key"] = self.api_key
+        url = f"{self.base_url}/{endpoint}"
+        
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        print(f"API Error: {response.status}")
+                        return None
+            except Exception as e:
+                print(f"Request failed: {e}")
+                return None
+
+    def extract_video_id(self, url: str) -> Optional[str]:
+        """Extract video ID from YouTube URL"""
+        patterns = [
+            r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+            r'(?:embed\/)([0-9A-Za-z_-]{11})',
+            r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        return None
+
+    def extract_playlist_id(self, url: str) -> Optional[str]:
+        """Extract playlist ID from YouTube URL"""
+        match = re.search(r'list=([a-zA-Z0-9_-]+)', url)
+        return match.group(1) if match else None
+
     async def exists(self, link: str, videoid: bool | str = None):
         if videoid:
-            link = self.base + link
-        if re.search(self.regex, link):
-            return True
+            video_id = link
         else:
+            video_id = self.extract_video_id(link)
+            
+        if not video_id:
             return False
+            
+        # Check if video exists using API
+        params = {
+            "part": "id",
+            "id": video_id
+        }
+        
+        result = await self._make_api_request("videos", params)
+        return result and len(result.get("items", [])) > 0
 
     @property
     def use_fallback(self):
@@ -94,54 +147,108 @@ class YouTube:
     @alru_cache(maxsize=None)
     async def details(self, link: str, videoid: bool | str = None):
         if videoid:
-            link = self.base + link
-        if "&" in link:
-            link = link.split("&")[0]
-        results = VideosSearch(link, limit=1)
-        for result in (await results.next())["result"]:
-            title = result["title"]
-            duration_min = result["duration"]
-            thumbnail = result["thumbnails"][0]["url"].split("?")[0]
-            vidid = result["id"]
-            if str(duration_min) == "None":
-                duration_sec = 0
-            else:
-                duration_sec = int(time_to_seconds(duration_min))
-        return title, duration_min, duration_sec, thumbnail, vidid
+            video_id = link
+        else:
+            video_id = self.extract_video_id(link)
+            
+        if not video_id:
+            return None
+            
+        params = {
+            "part": "snippet,contentDetails",
+            "id": video_id
+        }
+        
+        result = await self._make_api_request("videos", params)
+        
+        if not result or not result.get("items"):
+            return None
+            
+        video = result["items"][0]
+        snippet = video["snippet"]
+        content_details = video["contentDetails"]
+        
+        title = snippet["title"]
+        duration_iso = content_details["duration"]
+        # Convert ISO 8601 duration to seconds
+        duration_sec = self._parse_duration(duration_iso)
+        duration_min = seconds_to_min(duration_sec) if duration_sec else "0:00"
+        
+        # Get highest quality thumbnail
+        thumbnails = snippet["thumbnails"]
+        thumbnail = (thumbnails.get("maxres") or 
+                    thumbnails.get("high") or 
+                    thumbnails.get("medium") or 
+                    thumbnails.get("default", {})).get("url", "")
+        
+        return title, duration_min, duration_sec, thumbnail, video_id
+
+    def _parse_duration(self, duration: str) -> int:
+        """Parse ISO 8601 duration to seconds"""
+        import re
+        
+        pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
+        match = re.match(pattern, duration)
+        
+        if not match:
+            return 0
+            
+        hours = int(match.group(1) or 0)
+        minutes = int(match.group(2) or 0)
+        seconds = int(match.group(3) or 0)
+        
+        return hours * 3600 + minutes * 60 + seconds
 
     @alru_cache(maxsize=None)
     async def title(self, link: str, videoid: bool | str = None):
-        if videoid:
-            link = self.base + link
-        if "&" in link:
-            link = link.split("&")[0]
-        results = VideosSearch(link, limit=1)
-        for result in (await results.next())["result"]:
-            title = result["title"]
-        return title
+        details = await self.details(link, videoid)
+        return details[0] if details else None
 
     @alru_cache(maxsize=None)
     async def duration(self, link: str, videoid: bool | str = None):
-        if videoid:
-            link = self.base + link
-        if "&" in link:
-            link = link.split("&")[0]
-        results = VideosSearch(link, limit=1)
-        for result in (await results.next())["result"]:
-            duration = result["duration"]
-        return duration
+        details = await self.details(link, videoid)
+        return details[1] if details else None
 
     @alru_cache(maxsize=None)
     async def thumbnail(self, link: str, videoid: bool | str = None):
-        if videoid:
-            link = self.base + link
-        if "&" in link:
-            link = link.split("&")[0]
-        results = VideosSearch(link, limit=1)
-        for result in (await results.next())["result"]:
-            thumbnail = result["thumbnails"][0]["url"].split("?")[0]
-        return thumbnail
+        details = await self.details(link, videoid)
+        return details[3] if details else None
 
+    async def search_videos(self, query: str, max_results: int = 10) -> List[Dict]:
+        """Search for videos using YouTube API"""
+        params = {
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "maxResults": max_results,
+            "order": "relevance"
+        }
+        
+        result = await self._make_api_request("search", params)
+        
+        if not result or not result.get("items"):
+            return []
+            
+        videos = []
+        for item in result["items"]:
+            video_id = item["id"]["videoId"]
+            snippet = item["snippet"]
+            
+            # Get video details for duration
+            video_details = await self.details(video_id, videoid=True)
+            
+            videos.append({
+                "id": video_id,
+                "title": snippet["title"],
+                "link": f"https://www.youtube.com/watch?v={video_id}",
+                "thumbnail": snippet["thumbnails"]["high"]["url"],
+                "duration": video_details[1] if video_details else "0:00",
+                "channel": snippet["channelTitle"]
+            })
+            
+        return videos
+
+    # Keep the existing video download methods as they still use yt-dlp
     async def video(self, link: str, videoid: bool | str = None):
         if videoid:
             link = self.base + link
@@ -170,53 +277,73 @@ class YouTube:
     @alru_cache(maxsize=None)
     async def playlist(self, link, limit, videoid: bool | str = None):
         if videoid:
-            link = self.listbase + link
-        if "&" in link:
-            link = link.split("&")[0]
-
-        cmd = (
-            f"yt-dlp -i --compat-options no-youtube-unavailable-videos "
-            f'--get-id --flat-playlist --playlist-end {limit} --skip-download "{link}" '
-            f"2>/dev/null"
-        )
-
-        playlist = await shell_cmd(cmd)
-
-        try:
-            result = [key for key in playlist.split("\n") if key]
-        except Exception:
-            result = []
-        return result
+            playlist_id = link
+        else:
+            playlist_id = self.extract_playlist_id(link)
+            
+        if not playlist_id:
+            return []
+            
+        params = {
+            "part": "snippet",
+            "playlistId": playlist_id,
+            "maxResults": min(limit, 50)  # API limit is 50
+        }
+        
+        result = await self._make_api_request("playlistItems", params)
+        
+        if not result or not result.get("items"):
+            return []
+            
+        video_ids = []
+        for item in result["items"]:
+            video_id = item["snippet"]["resourceId"]["videoId"]
+            video_ids.append(video_id)
+            
+        return video_ids
 
     @alru_cache(maxsize=None)
     async def track(self, link: str, videoid: bool | str = None):
         if videoid:
+            video_id = link
             link = self.base + link
-        if "&" in link:
-            link = link.split("&")[0]
-        # if link.startswith("http://") or link.startswith("https://"):
-        #     return await self._track(link)
-        try:
-            results = VideosSearch(link, limit=1)
-            for result in (await results.next())["result"]:
-                title = result["title"]
-                duration_min = result["duration"]
-                vidid = result["id"]
-                yturl = result["link"]
-                thumbnail = result["thumbnails"][0]["url"].split("?")[0]
+        else:
+            video_id = self.extract_video_id(link)
+            
+        if not video_id:
+            # If no video ID found, search for the query
+            search_results = await self.search_videos(link, 1)
+            if search_results:
+                video = search_results[0]
+                track_details = {
+                    "title": video["title"],
+                    "link": video["link"],
+                    "vidid": video["id"],
+                    "duration_min": video["duration"],
+                    "thumb": video["thumbnail"],
+                }
+                return track_details, video["id"]
+            else:
+                return await self._track(link)
+        
+        # Get video details using API
+        details = await self.details(video_id, videoid=True)
+        if details:
+            title, duration_min, duration_sec, thumbnail, vidid = details
             track_details = {
                 "title": title,
-                "link": yturl,
+                "link": link,
                 "vidid": vidid,
                 "duration_min": duration_min,
                 "thumb": thumbnail,
             }
             return track_details, vidid
-        except Exception:
+        else:
             return await self._track(link)
 
     @asyncify
     def _track(self, q):
+        # Fallback to yt-dlp for search
         options = {
             "format": "best",
             "noplaylist": True,
@@ -240,6 +367,7 @@ class YouTube:
             }
             return info, details["id"]
 
+    # Keep all the existing download methods as they use yt-dlp
     @alru_cache(maxsize=None)
     @asyncify
     def formats(self, link: str, videoid: bool | str = None):
@@ -290,17 +418,14 @@ class YouTube:
         query_type: int,
         videoid: bool | str = None,
     ):
-        if videoid:
-            link = self.base + link
-        if "&" in link:
-            link = link.split("&")[0]
-        a = VideosSearch(link, limit=10)
-        result = (await a.next()).get("result")
-        title = result[query_type]["title"]
-        duration_min = result[query_type]["duration"]
-        vidid = result[query_type]["id"]
-        thumbnail = result[query_type]["thumbnails"][0]["url"].split("?")[0]
-        return title, duration_min, thumbnail, vidid
+        # Use API search instead of VideosSearch
+        search_results = await self.search_videos(link, 10)
+        
+        if query_type < len(search_results):
+            video = search_results[query_type]
+            return video["title"], video["duration"], video["thumbnail"], video["id"]
+        
+        return None, None, None, None
 
     async def download(
         self,
@@ -313,6 +438,7 @@ class YouTube:
         format_id: bool | str = None,
         title: bool | str = None,
     ) -> str:
+        # Keep the existing download implementation as it uses yt-dlp
         if videoid:
             link = self.base + link
 
@@ -447,3 +573,7 @@ class YouTube:
             downloaded_file = await audio_dl()
 
         return downloaded_file, direct
+
+
+# For backward compatibility, alias the new class
+YouTube = YouTubeAPI
